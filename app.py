@@ -4,14 +4,17 @@ import re
 import zipfile
 from enum import Enum
 from io import BytesIO
-from typing import List
+from typing import List, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-app = FastAPI(title="AtlanticCheck API")
+app = FastAPI(title="AtlanticCheck API", version="2.0.0")
 
 MAX_FILES = 300
-MAX_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_INNER_ENTRIES = 2000
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,23 +29,24 @@ class Status(str, Enum):
     BANNED = "BANNED"
     SUSPICIOUS = "SUSPICIOUS"
 
+class ModScanResult(BaseModel):
+    filename: str
+    status: Status
+    name: str
+    reason: str
+    punishment: Optional[str] = None
+    hash: str
+
 # =========================================================================
-# 1. ГЛУБОКИЕ СИГНАТУРЫ ЧИТОВ И СКРЫТЫХ ИНЖЕКТОВ (ПРОВЕРЯЮТСЯ ПО ВСЕМУ JAR)
+# 1. ГЛУБОКИЕ СИГНАТУРЫ ЧИТОВ И СКРЫТЫХ ИНЖЕКТОВ
 # =========================================================================
-DEEP_BANNED_SIGNATURES = [
-    # InvMove / Движение в GUI (Бан 5 дней)
+RAW_DEEP_BANNED = [
     (r"invmove|inventorywalk|movementingui|movement_in_gui|me/pieking1215/invmove",
      "InvMove", "Бан 5 дней", "Передвижение и прыжки с открытым инвентарём/меню"),
-
-    # X-Ray инжекты и датапаки (Бан 28 дней)
     (r"(replaceable_x_ray|bizcub|\bx_ray\b|net/minecraft/xray)",
      "X-Ray Mod", "Бан 28 дней", "Рентген руд и блоков / поиск ресурсов"),
-
-    # Боты (Бан 28 дней)
     (r"(^|[/\._])baritone([/\._]|$)", "Baritone", "Бан 28 дней", "Автоматизированный бот"),
     (r"(^|[/\._])fabriton([/\._]|$)", "Fabriton", "Бан 28 дней", "Автоматизированный бот"),
-
-    # Чит-клиенты (Бан 28 дней)
     (r"(^|[/\._])meteor([/\._]|$)", "Meteor Client", "Бан 28 дней", "Чит-клиент"),
     (r"(^|[/\._])expensive([/\._]|$)", "Expensive Client", "Бан 28 дней", "Чит-клиент"),
     (r"(^|[/\._])celestial([/\._]|$)", "Celestial Client", "Бан 28 дней", "Чит-клиент"),
@@ -54,9 +58,9 @@ DEEP_BANNED_SIGNATURES = [
 ]
 
 # =========================================================================
-# 2. СПИСОК ЗАПРЕЩЁННЫХ МОДИФИКАЦИЙ (ПО РЕГЛАМЕНТУ НАКАЗАНИЙ)
+# 2. СПИСОК ЗАПРЕЩЁННЫХ МОДИФИКАЦИЙ (ПО РЕГЛАМЕНТУ)
 # =========================================================================
-TARGETED_BANNED_MODS = [
+RAW_TARGETED_BANNED = [
     # --- 3 дня ---
     (r"\b(armorhotswap|armor_hot_swap)\b", "ArmorHotSwap", "Бан 3 дня", "Быстрая автоматическая смена элементов брони"),
     (r"\b(elytraswap|elytra_swap)\b(?!.*jjelytraswap)", "ElytraSwap", "Бан 3 дня", "Автоматическая смена нагрудника на элитры"),
@@ -96,8 +100,6 @@ TARGETED_BANNED_MODS = [
     (r"\b(nodarknesseffect|removewardeneffect|no_darkness_effect)\b", "No Darkness Effect", "Бан 10 дней", "Отключение эффекта тьмы"),
     (r"\b(donthitteammates|dont_hit_teammates)\b", "Dont Hit Teammates", "Бан 10 дней", "Фильтр союзников в PvP"),
     (r"\b(autojumpreset|auto_jump_reset)\b", "AutoJumpReset", "Бан 10 дней", "Сброс кулдауна прыжков в PvP"),
-
-    # Запрещённые визуалы (Бан 10 дней)
     (r"fevervisuals", "FeverVisuals", "Бан 10 дней", "Запрещённый визуал-пак"),
     (r"(^|[/\._\-])ascart([/\._\-]|$)", "Ascart", "Бан 10 дней", "Запрещённый клиент"),
     (r"simplevisuals", "SimpleVisuals", "Бан 10 дней", "Запрещённый визуал-пак"),
@@ -140,13 +142,13 @@ TARGETED_BANNED_MODS = [
     (r"\b(autoaim|auto_aim)\b", "AutoAim", "Бан 18 дней", "Авто-наводка"),
     (r"(^|[/\._\-])inventoryprofilesnext([/\._\-]|$)", "Inventory Profiles Next", "Бан 18 дней", "Авто-сортировка инвентаря"),
 
-    # --- 28 дней (Автоматизация, читы, дамп и экономика) ---
+    # --- 28 дней ---
     (r"\b(autocrystal|auto_crystal)\b", "AutoCrystal", "Бан 28 дней", "Автоматическая установка и подрыв кристаллов края"),
     (r"\b(autofish|auto_fish|xplusautofish)\b", "AutoFish", "Бан 28 дней", "Автоматическая рыбалка в AFK-режиме"),
     (r"\b(femalegender|female_gender|femalegendermod)\b", "Female Gender Mod", "Бан 28 дней", "Запрещённая клиентская модификация моделей"),
     (r"\b(inventorytotem|inventory_totem)\b", "Inventory Totem", "Бан 28 дней", "Автоматическое взятие тотема в руку перед смертью"),
     (r"\b(seedcracker|seed_cracker|seedcrackerx)\b", "SeedCrackerX", "Бан 28 дней", "Взлом и вычисление сида (генерации) мира сервера"),
-    (r"\b(shulkeropener|shulker_opener)\b", "ShulkerOpener", "Бан 28 дней", "Открытие шалкера прямо из инвентаря без его установки на землю"),
+    (r"\b(shulkeropener|shulker_opener|openinv|open_inv)\b", "ShulkerOpener / OpenInv", "Бан 28 дней", "Открытие шалкера/инвентаря без установки или разрешения"),
     (r"\b(slippery|slipperymod)\b", "Slippery Mod", "Бан 28 дней", "Модификация физики скольжения и передвижения"),
     (r"\btweakeroo\b", "Tweakeroo", "Бан 28 дней", "Чит-твики (FreeCam, FastBlockPlacement, FlexiblePlacement и др.)"),
     (r"\b(walljump|wall_jump|walljumptxf)\b", "Wall-Jump TXF", "Бан 28 дней", "Прыжки и отталкивание от стен"),
@@ -171,8 +173,12 @@ TARGETED_BANNED_MODS = [
     (r"\bfreecam\b(?!.*(replay|compat))", "FreeCam", "Бан 28 дней", "Свободная камера сквозь блоки")
 ]
 
+# Предварительная компиляция регулярных выражений
+DEEP_BANNED_COMPILED = [(re.compile(p, re.IGNORECASE), name, dur, rsn) for p, name, dur, rsn in RAW_DEEP_BANNED]
+TARGETED_BANNED_COMPILED = [(re.compile(p, re.IGNORECASE), name, dur, rsn) for p, name, dur, rsn in RAW_TARGETED_BANNED]
+
 # =========================================================================
-# 3. ПОЛНЫЙ БЕЛЫЙ СПИСОК (UNDETECT - РАЗРЕШЁННЫЕ МОДЫ И БИБЛИОТЕКИ)
+# 3. БЕЛЫЙ СПИСОК (UNDETECT)
 # =========================================================================
 ALLOWED_WHITELIST_RAW = {
     # Сетевые и чат-патчи
@@ -188,35 +194,26 @@ ALLOWED_WHITELIST_RAW = {
     "clienttweaks", "client_tweaks", "client-tweaks",
     "commandkeys", "command_keys", "command-keys",
     "cwb", "cubeswithoutborders", "cubes_without_borders", "cubes-without-borders",
-    "debugify",
-    "defaultoptions", "default_options", "default-options",
+    "debugify", "defaultoptions", "default_options", "default-options",
     "healthindicators", "health_indicators", "health-indicators",
     "keybindspurger", "keybinds_purger", "keybinds-purger",
     "modelfix", "modelgapfix", "model_gap_fix", "model-gap-fix",
-    "no-peeking", "nopeeking", "no_peeking",
-    "noxesium",
+    "no-peeking", "nopeeking", "no_peeking", "noxesium",
     "particle_core", "particlecore", "particle-core",
     "placeholder-api", "placeholder_api", "placeholderapi",
-    "prickle", "pricklemc",
-    "resourcefulconfig", "resourceful_config", "resourceful-config",
+    "prickle", "pricklemc", "resourcefulconfig", "resourceful_config", "resourceful-config",
     "rrls", "removereloadingscreen", "remove_reloading_screen", "remove-reloading-screen",
-    "satin",
-    "scoreboardtweaks", "scoreboard_tweaks", "scoreboard-tweaks",
-    "shieldfixes", "shield_fixes", "shield-fixes",
-    "shieldstatusmod", "shield_status_mod", "shield-status-mod",
-    "skyboxify",
-    "smoothskies", "smooth_skies", "smooth-skies",
+    "satin", "scoreboardtweaks", "scoreboard_tweaks", "scoreboard-tweaks",
+    "shieldfixes", "shield_fixes", "shield-fixes", "shieldstatusmod", "shield_status_mod", "shield-status-mod",
+    "skyboxify", "smoothskies", "smooth_skies", "smooth-skies",
     "sodium-shadowy-path-blocks", "sodium_shadowy_path_blocks", "sodiumshadowypathblocks",
     "shadowypathblocks", "shadowy_path_blocks", "shadowy-path-blocks",
     "tcdcommons", "tcdcommonsapi", "tcd_commons_api", "tcd-commons-api",
-    "titlefixer", "title_fixer", "title-fixer",
-    "titletweaks", "title_tweaks", "title-tweaks",
-    "ukulib", "uku3lig",
-    "visualkeys", "visual_keys", "visual-keys",
-    "walksylib", "walksy_lib", "walksy-lib",
-    "yet_another_config_lib_v3", "yet_another_config_lib", "yacl", "yetanotherconfiglib",
-    "anvianslib", "anvians_lib", "anvians-lib",
-    "attributefix", "attribute_fix", "attribute-fix",
+    "titlefixer", "title_fixer", "title-fixer", "titletweaks", "title_tweaks", "title-tweaks",
+    "ukulib", "uku3lig", "visualkeys", "visual_keys", "visual-keys",
+    "walksylib", "walksy_lib", "walksy-lib", "yet_another_config_lib_v3",
+    "yet_another_config_lib", "yacl", "yetanotherconfiglib",
+    "anvianslib", "anvians_lib", "anvians-lib", "attributefix", "attribute_fix", "attribute-fix",
 
     # Авторизация, голос, зум
     "voicechat", "simple-voice-chat", "simple_voice_chat", "plasmovoice", "plasmo-voice",
@@ -260,20 +257,7 @@ ALLOWED_WHITELIST_RAW = {
     "skinlayers3d", "3dskinlayers", "waveycapes", "simpleinventorysort", "inventorysorter",
     "inventory-profiles-next-api",
 
-    # Звуки, Анимации, Текстуры и QoL
-    "entity_texture_features", "entity-texture-features", "entitytexturefeatures", "etf",
-    "entity_model_features", "entity-model-features", "entitymodelfeatures", "emf",
-    "presencefootsteps", "soundphysics", "sound_physics_remastered", "ambientenvironment",
-    "fallingleaves", "notenoughanimations", "audioplayer", "sound-filters", "dynamic-music",
-    "music-duration", "auditory", "dynamiclights", "lambdynamiclights", "glowcase",
-    "morechathistory", "more-chat-history", "more_chat_history", "chatreportingpromise",
-    "no-chat-reports", "nochatreports", "essential", "screenshotclipboard", "resourcify",
-    "fast-ip-ping", "fastipping", "ipns", "smooth-scrolling-everywhere",
-    "eating-animation", "effective", "physicsmod", "visuality", "trajan-font",
-    "better-third-person", "bettermilk", "better-f3", "item-model-fix", "firstperson",
-    "first-person-model",
-
-    # Разрешённые клиенты и визуалы проекта Atlantic (п. 4.2)
+    # Атлантик-клиенты и визуалы
     "pulsevisuals", "topkavisuals", "customblockoverlay", "trajectoryguard",
     "viewmodel-changer", "viewmodelchanger", "viewmodel", "rainvisuals",
     "doabarrelroll", "moonlightclient", "soupapi", "soupvisuals", "soupbetter",
@@ -288,48 +272,80 @@ ALLOWED_WHITELIST_RAW = {
 
 ALLOWED_CLEAN = {re.sub(r"[-_\s]", "", m).lower() for m in ALLOWED_WHITELIST_RAW}
 
-def analyze_jar(content: bytes, filename: str):
+def extract_mod_metadata(jar: zipfile.ZipFile, filename: str):
+    mod_id = ""
+    mod_name = filename
+    namelist = jar.namelist()
+
+    # 1. Fabric
+    if "fabric.mod.json" in namelist:
+        try:
+            data = json.loads(jar.read("fabric.mod.json").decode("utf-8", errors="ignore"))
+            mod_id = str(data.get("id", "")).strip().lower()
+            mod_name = str(data.get("name", mod_name)).strip()
+            return mod_id, mod_name
+        except Exception:
+            pass
+
+    # 2. Forge / NeoForge
+    for manifest_path in ("META-INF/mods.toml", "META-INF/neoforge.mods.toml"):
+        if manifest_path in namelist:
+            try:
+                toml_text = jar.read(manifest_path).decode("utf-8", errors="ignore")
+                for line in toml_text.splitlines():
+                    cleaned = line.strip()
+                    if cleaned.startswith("modId="):
+                        mod_id = cleaned.split("=", 1)[1].strip().strip('"\'').lower()
+                    elif cleaned.startswith("displayName=") and mod_name == filename:
+                        mod_name = cleaned.split("=", 1)[1].strip().strip('"\'')
+                if mod_id:
+                    return mod_id, mod_name
+            except Exception:
+                pass
+
+    # 3. Quilt
+    if "quilt.mod.json" in namelist:
+        try:
+            data = json.loads(jar.read("quilt.mod.json").decode("utf-8", errors="ignore"))
+            qloader = data.get("quilt_loader", {})
+            mod_id = str(qloader.get("id", "")).strip().lower()
+            mod_name = str(qloader.get("metadata", {}).get("name", mod_name)).strip()
+            return mod_id, mod_name
+        except Exception:
+            pass
+
+    # 4. Legacy Forge mcmod.info
+    if "mcmod.info" in namelist:
+        try:
+            info_data = json.loads(jar.read("mcmod.info").decode("utf-8", errors="ignore"))
+            entry = info_data[0] if isinstance(info_data, list) and info_data else info_data.get("modList", [{}])[0]
+            mod_id = str(entry.get("modid", "")).strip().lower()
+            mod_name = str(entry.get("name", mod_name)).strip()
+            return mod_id, mod_name
+        except Exception:
+            pass
+
+    return mod_id, mod_name
+
+def analyze_jar_sync(content: bytes, filename: str) -> dict:
     filename = (filename or "unknown.jar").strip() or "unknown.jar"
     sha256_hash = hashlib.sha256(content).hexdigest()
     file_size_kb = round(len(content) / 1024)
-    mod_id = ""
-    mod_name = filename
-    internal_paths = []
 
     try:
         with zipfile.ZipFile(BytesIO(content)) as jar:
+            if len(jar.infolist()) > MAX_INNER_ENTRIES:
+                return {
+                    "filename": filename,
+                    "status": Status.BANNED,
+                    "name": filename,
+                    "reason": "Архив содержит аномальное количество файлов (Zip-Bomb)",
+                    "punishment": "Бан 28 дней",
+                    "hash": sha256_hash
+                }
+
             internal_paths = [name.lower() for name in jar.namelist()]
-
-            # Fabric Manifest
-            if "fabric.mod.json" in jar.namelist():
-                try:
-                    data = json.loads(jar.read("fabric.mod.json").decode("utf-8", errors="ignore"))
-                    mod_id = str(data.get("id", "")).strip().lower()
-                    mod_name = str(data.get("name", mod_name)).strip()
-                except Exception:
-                    pass
-
-            # Forge / NeoForge Manifest
-            elif "META-INF/mods.toml" in jar.namelist() or "META-INF/neoforge.mods.toml" in jar.namelist():
-                manifest_name = "META-INF/mods.toml" if "META-INF/mods.toml" in jar.namelist() else "META-INF/neoforge.mods.toml"
-                toml_text = jar.read(manifest_name).decode("utf-8", errors="ignore").lower()
-                for line in toml_text.splitlines():
-                    if line.strip().startswith("modid="):
-                        mod_id = line.split("=")[1].strip().replace('"', '').replace("'", "")
-                        break
-                    if line.strip().startswith("displayname="):
-                        mod_name = line.split("=")[1].strip().replace('"', '').replace("'", "")
-
-            # Quilt Manifest
-            elif "quilt.mod.json" in jar.namelist():
-                try:
-                    data = json.loads(jar.read("quilt.mod.json").decode("utf-8", errors="ignore"))
-                    quilt_loader = data.get("quilt_loader", {})
-                    mod_id = str(quilt_loader.get("id", "")).strip().lower()
-                    metadata = quilt_loader.get("metadata", {})
-                    mod_name = str(metadata.get("name", mod_name)).strip()
-                except Exception:
-                    pass
+            mod_id, mod_name = extract_mod_metadata(jar, filename)
 
     except (zipfile.BadZipFile, OSError, ValueError):
         return {
@@ -341,18 +357,16 @@ def analyze_jar(content: bytes, filename: str):
             "hash": sha256_hash
         }
 
-    # Очистка имени файла от версий и суффиксов
     raw_fn = filename.lower().replace(".jar", "")
     clean_fn = re.sub(r"[-_\s0-9\+\.]", "", raw_fn)
     clean_fn_stripped = re.sub(r"(fabric|forge|neoforge|quilt|mc.*)", "", clean_fn)
-
     clean_mod_id = re.sub(r"[-_\s]", "", mod_id)
     target_names = f"{filename} {mod_id} {mod_name}".lower()
-
-    # 1. ПРИОРИТЕТ #1: Поиск глубоких чит-инжектов и скрытых сигнатур
     paths_str = " ".join(internal_paths)
-    for pattern, ban_name, duration, reason in DEEP_BANNED_SIGNATURES:
-        if re.search(pattern, f"{mod_id} {paths_str}", re.IGNORECASE):
+
+    # 1. Глубокие сигнатуры
+    for pattern, ban_name, duration, reason in DEEP_BANNED_COMPILED:
+        if pattern.search(f"{mod_id} {paths_str}"):
             return {
                 "filename": filename,
                 "status": Status.BANNED,
@@ -362,7 +376,7 @@ def analyze_jar(content: bytes, filename: str):
                 "hash": sha256_hash
             }
 
-    # 2. ПРИОРИТЕТ #2: Особые проверки размеров (Luminar / Plintus Visuals)
+    # 2. Проверка размеров (Luminar / Plintus Visuals)
     if "luminarvisuals" in clean_mod_id or "luminarvisuals" in clean_fn:
         if not (abs(file_size_kb - 7771) <= 30 or abs(file_size_kb - 4867) <= 30):
             return {
@@ -385,9 +399,9 @@ def analyze_jar(content: bytes, filename: str):
                 "hash": sha256_hash
             }
 
-    # 3. ПРИОРИТЕТ #3: Проверка по базе запрещённых модов (по имени/ID)
-    for pattern, ban_name, duration, reason in TARGETED_BANNED_MODS:
-        if re.search(pattern, target_names, re.IGNORECASE):
+    # 3. Таргетированные запреты
+    for pattern, ban_name, duration, reason in TARGETED_BANNED_COMPILED:
+        if pattern.search(target_names):
             return {
                 "filename": filename,
                 "status": Status.BANNED,
@@ -397,9 +411,19 @@ def analyze_jar(content: bytes, filename: str):
                 "hash": sha256_hash
             }
 
-    # 4. ПРИОРИТЕТ #4: Проверка по белому списку (Undetect)
-    # 4.1 Проверка по mod_id из манифеста
-    if mod_id and (mod_id in ALLOWED_WHITELIST_RAW or clean_mod_id in ALLOWED_CLEAN):
+    # 4. Белый список
+    is_whitelisted = (
+        (mod_id and (mod_id in ALLOWED_WHITELIST_RAW or clean_mod_id in ALLOWED_CLEAN)) or
+        clean_fn in ALLOWED_CLEAN or
+        clean_fn_stripped in ALLOWED_CLEAN or
+        any(
+            t in ALLOWED_CLEAN
+            for token in re.split(r"[-_\s\.]+", raw_fn)
+            if (t := re.sub(r"[0-9\+]", "", token)) and len(t) >= 3
+        )
+    )
+
+    if is_whitelisted:
         return {
             "filename": filename,
             "status": Status.ALLOWED,
@@ -409,31 +433,7 @@ def analyze_jar(content: bytes, filename: str):
             "hash": sha256_hash
         }
 
-    # 4.2 Проверка по полному или очищенному имени файла
-    if clean_fn in ALLOWED_CLEAN or clean_fn_stripped in ALLOWED_CLEAN:
-        return {
-            "filename": filename,
-            "status": Status.ALLOWED,
-            "name": mod_name if mod_name != filename else filename,
-            "reason": "Модификация проверена и входит в белый список разрешённых модов",
-            "punishment": None,
-            "hash": sha256_hash
-        }
-
-    # 4.3 Проверка по токенам из названия файла
-    for token in re.split(r"[-_\s\.]+", raw_fn):
-        clean_token = re.sub(r"[0-9\+]", "", token)
-        if clean_token and len(clean_token) >= 3 and clean_token in ALLOWED_CLEAN:
-            return {
-                "filename": filename,
-                "status": Status.ALLOWED,
-                "name": mod_name if mod_name != filename else filename,
-                "reason": "Модификация проверена и входит в белый список разрешённых модов",
-                "punishment": None,
-                "hash": sha256_hash
-            }
-
-    # 5. НЕИЗВЕСТНЫЙ МОД
+    # 5. Подозрительный / неизвестный
     return {
         "filename": filename,
         "status": Status.SUSPICIOUS,
@@ -443,7 +443,7 @@ def analyze_jar(content: bytes, filename: str):
         "hash": sha256_hash
     }
 
-@app.post("/api/scan")
+@app.post("/api/scan", response_model=List[ModScanResult])
 async def scan_mods(files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="Не переданы файлы для проверки")
@@ -452,14 +452,17 @@ async def scan_mods(files: List[UploadFile] = File(...)):
 
     results = []
     total_size = 0
+
     for file in files:
         filename = (file.filename or "").strip()
         if not filename.lower().endswith(".jar"):
             continue
+
         content = await file.read(MAX_TOTAL_BYTES + 1)
         total_size += len(content)
         if total_size > MAX_TOTAL_BYTES:
             raise HTTPException(status_code=413, detail="Общий размер файлов не должен превышать 50 МБ")
+
         if not content:
             results.append({
                 "filename": filename,
@@ -470,9 +473,12 @@ async def scan_mods(files: List[UploadFile] = File(...)):
                 "hash": hashlib.sha256(content).hexdigest(),
             })
             continue
-        analysis = analyze_jar(content, filename)
+
+        analysis = await run_in_threadpool(analyze_jar_sync, content, filename)
         results.append(analysis)
         await file.close()
+
     if not results:
         raise HTTPException(status_code=400, detail="Поддерживаются только файлы с расширением .jar")
+
     return results
