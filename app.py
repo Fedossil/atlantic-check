@@ -5,15 +5,18 @@ import zipfile
 from enum import Enum
 from io import BytesIO
 from typing import List
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="AtlanticCheck API")
 
+MAX_FILES = 300
+MAX_TOTAL_BYTES = 50 * 1024 * 1024
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -286,6 +289,7 @@ ALLOWED_WHITELIST_RAW = {
 ALLOWED_CLEAN = {re.sub(r"[-_\s]", "", m).lower() for m in ALLOWED_WHITELIST_RAW}
 
 def analyze_jar(content: bytes, filename: str):
+    filename = (filename or "unknown.jar").strip() or "unknown.jar"
     sha256_hash = hashlib.sha256(content).hexdigest()
     file_size_kb = round(len(content) / 1024)
     mod_id = ""
@@ -327,7 +331,7 @@ def analyze_jar(content: bytes, filename: str):
                 except Exception:
                     pass
 
-    except zipfile.BadZipFile:
+    except (zipfile.BadZipFile, OSError, ValueError):
         return {
             "filename": filename,
             "status": Status.BANNED,
@@ -441,11 +445,34 @@ def analyze_jar(content: bytes, filename: str):
 
 @app.post("/api/scan")
 async def scan_mods(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="Не переданы файлы для проверки")
+    if len(files) > MAX_FILES:
+        raise HTTPException(status_code=413, detail=f"Можно проверить не более {MAX_FILES} файлов")
+
     results = []
+    total_size = 0
     for file in files:
-        if not file.filename.endswith(".jar"):
+        filename = (file.filename or "").strip()
+        if not filename.lower().endswith(".jar"):
             continue
-        content = await file.read()
-        analysis = analyze_jar(content, file.filename)
+        content = await file.read(MAX_TOTAL_BYTES + 1)
+        total_size += len(content)
+        if total_size > MAX_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="Общий размер файлов не должен превышать 50 МБ")
+        if not content:
+            results.append({
+                "filename": filename,
+                "status": Status.BANNED,
+                "name": filename,
+                "reason": "Пустой файл не может быть проверен",
+                "punishment": "Бан 28 дней",
+                "hash": hashlib.sha256(content).hexdigest(),
+            })
+            continue
+        analysis = analyze_jar(content, filename)
         results.append(analysis)
+        await file.close()
+    if not results:
+        raise HTTPException(status_code=400, detail="Поддерживаются только файлы с расширением .jar")
     return results
